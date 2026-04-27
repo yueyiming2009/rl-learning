@@ -177,21 +177,45 @@ Each transformer layer requires exactly **2 AllReduce calls** per forward pass
 ### 2.2 Data Parallelism (DP=4, FSDP)
 
 The global batch is split evenly across the 4 DP ranks.
-With FSDP (ZeRO-3 equivalent), each DP rank holds only `1/DP` of each weight shard,
-saving memory by a factor of 4.
+FSDP (ZeRO-3 equivalent) shards every weight across DP ranks so each GPU holds only `1/DP`
+of each tensor, saving memory by a factor of 4.
 
-* During the **forward pass**, each layer's weights are reconstructed via **AllGather**
-  before computation, then immediately discarded.
-* During the **backward pass**, gradients are immediately **ReduceScattered**:
-  each GPU accumulates only `1/DP` of the gradient tensor.
-* The optimizer step runs on the local gradient shard.
-* Before the **next forward pass** the updated shard is AllGathered again.
+The communication pattern per layer:
 
-This means the effective memory footprint for parameters per GPU is:
+**Forward — AllGather to reconstruct weights before compute:**
 ```
-7B params × 2 bytes / (TP=2 × DP=4) ≈ 437 MB per GPU
+Each GPU holds shard:  W_shard : (rows/DP, cols)
+AllGather across DP →  W_full  : (rows,    cols)   ← used for compute, then discarded
 ```
-plus optimizer state at 4 bytes × 2 moments / (TP × DP) ≈ 875 MB per GPU.
+
+**Backward — ReduceScatter to sync and re-shard gradients:**
+```
+Each GPU computes:      dW_full  : (rows,    cols)
+ReduceScatter across DP → dW_shard : (rows/DP, cols)   ← sum-reduced + sharded
+```
+
+**Optimizer step — local, no communication:**
+```
+W_shard -= lr * AdamW(dW_shard, m_shard, v_shard)
+```
+
+**Next forward — AllGather again.**
+
+Per layer per forward-backward, each GPU moves:
+
+| Op | Primitive | Volume per GPU |
+|----|-----------|---------------|
+| Reconstruct weights | AllGather | `param_size / DP` sent |
+| Sync gradients | ReduceScatter | `param_size / DP` received |
+
+Total across 32 layers ≈ `2 × (7B params / TP=2) × 2 bytes = 14 GB` moved per GPU
+per forward-backward pass (split evenly across AllGather and ReduceScatter).
+
+Memory footprint per GPU:
+```
+Parameters  : 7B × 2 bytes / (TP=2 × DP=4) ≈ 437 MB
+Optimizer   : 7B × 8 bytes / (TP=2 × DP=4) ≈ 875 MB   (Adam m + v in float32)
+```
 
 ### 2.3 Pipeline Parallelism (PP=1 — disabled in this example)
 
