@@ -131,7 +131,19 @@ out : (16, 512, 4096)       — full hidden, same on both ranks
 W_O is `(2048, 4096)` because its input dimension is the concatenated local heads
 `(16 heads × 128 = 2048)`, not the full hidden size.
 
-**FFN** applies the same pattern to gate/up and down:
+**FFN** uses SwiGLU (LLaMA's FFN variant). SwiGLU = Swish + Gated Linear Unit.
+Standard FFN is `ReLU(x @ W1) @ W2`. SwiGLU splits W1 into two parallel projections —
+gate and up — so gating and content are learned independently:
+
+```
+SwiGLU(x) = (x @ W_up) * Swish(x @ W_gate)
+           = (x @ W_up) * (x @ W_gate * sigmoid(x @ W_gate))
+```
+
+This adds a third matrix (W_gate) but each matrix is made narrower (F = 11008 ≈ 2/3 × 4 × H
+instead of 4 × H) to keep total parameter count similar to a standard FFN.
+
+With TP=2, the same column→row pattern applies:
 
 ```
 # Column-parallel gate + up, no comm
