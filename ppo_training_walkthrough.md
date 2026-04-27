@@ -283,6 +283,11 @@ Before rollout, the prompts are repeated n=4 times:
 prompts_repeated :  (4*n=16, P=512)   int64  ~64 KB per DP rank
 ```
 
+**CPU → GPU transfer**: the worker receives the batch on CPU via the Ray object store,
+then moves it to GPU with `.to(device)` before generation begins. This is the only point
+where host-to-device transfer happens for the input data. All subsequent computation
+(prefill, decode, training) stays on GPU.
+
 ---
 
 ### Phase 2 — Rollout (Autoregressive Generation)
