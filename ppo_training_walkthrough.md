@@ -231,9 +231,37 @@ dimensions between TP and SP groups.  Disabled here; included for reference.
 
 ### 2.5 Hybrid Engine
 
-verl's hybrid engine reuses the same physical GPUs for both rollout (inference) and
-training (gradient update).  After each training step the updated parameters are
-AllGathered from FSDP shards to reconstruct the full TP-sharded model for rollout.
+verl's hybrid engine time-multiplexes all four RL models on the same 8 GPUs rather than
+dedicating separate hardware to each. This avoids 4× the GPU cost at the expense of
+PCIe offload latency between phases.
+
+**Model placement**:
+
+| Model | Implementation | Memory |
+|-------|---------------|--------|
+| Actor | base weights + LoRA adapters (trainable) | ~437 MB base shard + ~10 MB LoRA |
+| Reference policy | same base weights, LoRA disabled | 0 extra — shares base with actor |
+| Critic | separate 7B model, same 8 GPUs | ~437 MB shard (offloaded when not in use) |
+| Reward model | same 8 GPUs or separate resource pool | time-multiplexed or isolated |
+
+**Actor = Reference + LoRA**: the base model weights are frozen and shared. The reference
+policy runs with LoRA disabled; the actor runs with LoRA enabled. Only the LoRA adapter
+weights are trained — roughly `2 × r × H × L = 2 × 16 × 4096 × 32 ≈ 4M` params vs 7B base.
+This also acts as a parameter-space KL constraint on top of the explicit KL penalty in the reward.
+If LoRA is disabled (full fine-tuning), a separate frozen reference copy must be kept, doubling
+weight memory.
+
+**Time-multiplexing timeline**:
+```
+Rollout   : Actor+Ref on GPU  |  Critic offloaded to CPU
+Phase 4-5 : Actor+Ref on GPU  |  Critic offloaded to CPU
+Phase 6   : Critic on GPU     |  Actor offloaded to CPU
+Phase 8   : Actor on GPU      |  Critic offloaded to CPU
+Phase 9   : Critic on GPU     |  Actor offloaded to CPU
+```
+
+After each training step, actor weights are AllGathered from FSDP shards to reconstruct
+the full TP-sharded model before the next rollout.
 
 ### 2.6 Flash Attention
 
